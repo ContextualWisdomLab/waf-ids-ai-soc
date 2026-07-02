@@ -1,6 +1,6 @@
 # Enterprise Product Package Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **Contributor note:** Execute this checklist task by task. Keep checkbox (`- [ ]`) status current as work moves through implementation, verification, PR, and merge.
 
 **Goal:** Turn the current runnable WAF/IDS/AI SOC baseline into a stronger 2B KRW enterprise product package by adding a maintainable core library boundary and committed product/design/analytics/complexity evidence.
 

@@ -144,7 +144,7 @@ Deployment assets:
 ## Workspace
 
 - `crates/waf-ids-core`: pure domain models, validation, upserts, scoring, DNSBL zone formatting, event retention, KPI snapshots, and commercial readiness snapshots.
-- `src/lib.rs`: Axum management API, admin console, optional state persistence, upstream proxying, support bundle assembly, and integration tests.
+- `src/lib.rs`: Axum management API, admin console, optional state persistence, upstream proxying, support bundle assembly, and in-crate HTTP tests.
 - `src/main.rs`: process configuration and server startup.
 
 The core is a local workspace crate rather than a git submodule because it does not yet have a separate release cadence or external consumers.

@@ -26,7 +26,7 @@ flowchart LR
 ## Components
 
 - `src/main.rs`: process startup and operator configuration from `BIND_ADDR`, `ADMIN_TOKEN`, `WAF_IDS_STATE_PATH`, `DNSBL_ORIGIN`, and `EVENT_LIMIT`.
-- `src/lib.rs`: Axum app, management APIs, optional JSON persistence, gateway handler, upstream proxying, support bundle assembly, and integration tests.
+- `src/lib.rs`: Axum app, management APIs, optional JSON persistence, gateway handler, upstream proxying, support bundle assembly, and in-crate HTTP tests.
 - `crates/waf-ids-core`: reusable domain models plus validation, upsert, scoring, DNSBL zone export, event retention, KPI snapshot, and commercial readiness logic.
 - `/admin`: embedded web console.
 - `/gateway/{path}`: route selection, request scoring, monitor/block decision, optional upstream proxying.
