@@ -16,15 +16,30 @@ async fn main() -> Result<(), Box<dyn Error>> {
     };
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
     println!("waf-ids-ai-soc listening on http://{bind_addr}");
-    axum::serve(listener, build_app(AppState::load(config).await?)).await?;
+    let state = AppState::load(config)
+        .await
+        .map_err(|message| io::Error::new(io::ErrorKind::InvalidData, message))?;
+    axum::serve(listener, build_app(state)).await?;
     Ok(())
 }
 
 #[cfg(not(test))]
 fn parse_event_limit() -> Result<usize, Box<dyn Error>> {
     let value = match env::var("EVENT_LIMIT") {
-        Ok(raw) => raw.parse::<usize>()?,
-        Err(_) => AppConfig::DEFAULT_EVENT_LIMIT,
+        Ok(raw) => raw.parse::<usize>().map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("EVENT_LIMIT must be a positive integer, got {raw:?}: {error}"),
+            )
+        })?,
+        Err(env::VarError::NotPresent) => AppConfig::DEFAULT_EVENT_LIMIT,
+        Err(error) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("EVENT_LIMIT is not valid Unicode: {error}"),
+            )
+            .into());
+        }
     };
 
     if value == 0 {

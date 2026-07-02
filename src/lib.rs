@@ -69,12 +69,17 @@ impl AppState {
         mutate: impl FnOnce(&mut AppData) -> T,
     ) -> Result<T, String> {
         let _guard = self.persist_lock.lock().await;
-        let (result, snapshot) = {
+        let (result, snapshot, previous) = {
             let mut data = self.inner.write().await;
+            let previous = data.clone();
             let result = mutate(&mut data);
-            (result, data.clone())
+            (result, data.clone(), previous)
         };
-        self.persist_snapshot(&snapshot).await?;
+        if let Err(error) = self.persist_snapshot(&snapshot).await {
+            let mut data = self.inner.write().await;
+            *data = previous;
+            return Err(error);
+        }
         Ok(result)
     }
 
@@ -190,9 +195,33 @@ async fn persist_state(path: &Path, data: &AppData) -> Result<(), String> {
     }
     let json =
         serde_json::to_vec_pretty(data).expect("AppData contains only JSON-serializable fields");
-    fs::write(path, json)
-        .await
-        .map_err(|error| format!("failed to write state file {}: {error}", path.display()))
+    let temp_path = temporary_state_path(path);
+    fs::write(&temp_path, json).await.map_err(|error| {
+        format!(
+            "failed to write temporary state file {}: {error}",
+            temp_path.display()
+        )
+    })?;
+    if let Err(error) = fs::rename(&temp_path, path).await {
+        let _ = fs::remove_file(&temp_path).await;
+        return Err(format!(
+            "failed to replace state file {}: {error}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn temporary_state_path(path: &Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("state");
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    path.with_file_name(format!(".{file_name}.tmp-{}-{unique}", std::process::id()))
 }
 
 fn normalized_origin(origin: &str) -> String {
@@ -1826,7 +1855,7 @@ mod tests {
         let error = persist_state(&write_dir, &AppData::seeded())
             .await
             .unwrap_err();
-        assert!(error.contains("failed to write state file"));
+        assert!(error.contains("failed to replace state file"));
         let _ = fs::remove_dir_all(write_dir).await;
     }
 
@@ -1835,14 +1864,17 @@ mod tests {
     async fn load_surfaces_state_rewrite_failures() {
         use std::os::unix::fs::PermissionsExt;
 
-        let read_only_file = temp_state_path("read-only-file");
+        let read_only_parent = temp_state_path("read-only-parent");
+        fs::create_dir_all(&read_only_parent).await.unwrap();
+        let read_only_file = read_only_parent.join("state.json");
         fs::write(
             &read_only_file,
             serde_json::to_vec_pretty(&AppData::seeded()).unwrap(),
         )
         .await
         .unwrap();
-        std::fs::set_permissions(&read_only_file, std::fs::Permissions::from_mode(0o400)).unwrap();
+        std::fs::set_permissions(&read_only_parent, std::fs::Permissions::from_mode(0o500))
+            .unwrap();
         let result = AppState::load(AppConfig {
             admin_token: None,
             state_path: Some(read_only_file.clone()),
@@ -1850,9 +1882,15 @@ mod tests {
             event_limit: 10,
         })
         .await;
-        assert!(result.err().unwrap().contains("failed to write state file"));
-        std::fs::set_permissions(&read_only_file, std::fs::Permissions::from_mode(0o600)).unwrap();
-        let _ = fs::remove_file(read_only_file).await;
+        assert!(
+            result
+                .err()
+                .unwrap()
+                .contains("failed to write temporary state file")
+        );
+        std::fs::set_permissions(&read_only_parent, std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        let _ = fs::remove_dir_all(read_only_parent).await;
 
         let read_only_dir = temp_state_path("read-only-dir");
         fs::create_dir_all(&read_only_dir).await.unwrap();
@@ -1864,7 +1902,12 @@ mod tests {
             event_limit: 10,
         })
         .await;
-        assert!(result.err().unwrap().contains("failed to write state file"));
+        assert!(
+            result
+                .err()
+                .unwrap()
+                .contains("failed to write temporary state file")
+        );
         std::fs::set_permissions(&read_only_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         let _ = fs::remove_dir_all(read_only_dir).await;
     }
@@ -1913,6 +1956,9 @@ mod tests {
         )
         .await;
         assert_eq!(route_response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let routes: Vec<RouteConfig> =
+            json_body(app_request(&app, empty_request(Method::GET, "/api/routes")).await).await;
+        assert!(!routes.iter().any(|route| route.id == "new"));
 
         let threat_response = app_request(
             &app,
@@ -1931,6 +1977,9 @@ mod tests {
         )
         .await;
         assert_eq!(threat_response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let threats: Vec<ThreatIndicator> =
+            json_body(app_request(&app, empty_request(Method::GET, "/api/threats")).await).await;
+        assert!(threats.is_empty());
 
         let dnsbl_response = app_request(
             &app,
@@ -1949,9 +1998,15 @@ mod tests {
         )
         .await;
         assert_eq!(dnsbl_response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let dnsbl: Vec<DnsblEntry> =
+            json_body(app_request(&app, empty_request(Method::GET, "/api/dnsbl")).await).await;
+        assert!(dnsbl.is_empty());
 
         let gateway_response = app_request(&app, empty_request(Method::GET, "/gateway/mock")).await;
         assert_eq!(gateway_response.status(), StatusCode::OK);
+        let events: Vec<SecurityEvent> =
+            json_body(app_request(&app, empty_request(Method::GET, "/api/events")).await).await;
+        assert!(events.is_empty());
         let _ = fs::remove_dir_all(failing_path).await;
     }
 

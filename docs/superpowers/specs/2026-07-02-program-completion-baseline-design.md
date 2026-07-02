@@ -28,7 +28,7 @@ The program is complete for this baseline when all of these are true:
 
 `src/main.rs` reads operator configuration from the environment and builds an `AppConfig`. `src/lib.rs` owns the Axum app, in-memory state, file-backed persistence, validators, scoring, event recording, and DNSBL export. The state file stores a single serialized `AppData` object so restart behavior can be tested without adding a database dependency.
 
-The write path is: validate request, mutate state under a write lock, clone the new state, release the lock, persist the snapshot if configured, then return the accepted object. Gateway event writes use the same persistence path but log persistence failures instead of failing a proxied request after a security decision has already been made.
+The management write path is: validate request, mutate state under a write lock, clone the new state, persist the snapshot if configured, and return the accepted object only after persistence succeeds. If persistence fails, the in-memory mutation is rolled back before the API returns `500`. State files are written to a temporary sibling file and then atomically renamed over the configured path to avoid partial JSON on process crash. Gateway event writes use the same consistency path but log persistence failures instead of failing a proxied request after a security decision has already been made.
 
 ## Testing
 

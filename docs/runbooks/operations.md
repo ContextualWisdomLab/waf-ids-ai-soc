@@ -33,6 +33,8 @@ scripts/smoke.sh
 
 The smoke test starts the service on a temporary port with a temporary JSON state file, verifies admin and management surfaces, creates a blocking route, triggers a blocked gateway request, checks KPIs and DNSBL export, restarts the process, and verifies that the route persisted.
 
+When `WAF_IDS_STATE_PATH` is enabled, the process writes a temporary sibling file and atomically replaces the configured state path. If a management write cannot be persisted, the in-memory mutation is rolled back and the API returns `500`.
+
 ## Safe Change Procedure
 
 1. Start new routes in `monitor` mode.
@@ -48,6 +50,7 @@ This baseline is suitable for local and controlled lab deployments. Internet-fac
 - TLS termination and identity-aware admin access
 - upstream allowlists and egress controls
 - durable database storage with backups
+- asynchronous event persistence or a database-backed event store for high-throughput gateway traffic
 - Coraza/OWASP CRS WAF adapter
 - Suricata EVE ingest for IDS events
 - STIX/TAXII, MISP, or OpenCTI feed import
