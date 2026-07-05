@@ -1325,6 +1325,34 @@ mod tests {
     }
 
     #[test]
+    fn validate_dnsbl_checks_prefix_len() {
+        let base = DnsblEntry {
+            address: "10.0.0.0".parse().unwrap(),
+            code: "127.0.0.2".to_string(),
+            reason: "range".to_string(),
+            source: "unit".to_string(),
+            ttl_seconds: 60,
+            prefix_len: Some(24),
+        };
+        assert!(validate_dnsbl(&base).is_ok());
+        let too_wide = DnsblEntry {
+            prefix_len: Some(40),
+            ..base.clone()
+        };
+        assert_eq!(
+            validate_dnsbl(&too_wide),
+            Err("DNSBL prefix_len exceeds the address family width")
+        );
+        // IPv6 permits prefixes up to /128.
+        let v6 = DnsblEntry {
+            address: "2001:db8::".parse().unwrap(),
+            prefix_len: Some(64),
+            ..base.clone()
+        };
+        assert!(validate_dnsbl(&v6).is_ok());
+    }
+
+    #[test]
     fn builds_upstream_target_from_route_prefix() {
         assert_eq!(
             upstream_target(&route(), "/api/v1/items", Some("limit=1")).unwrap(),
