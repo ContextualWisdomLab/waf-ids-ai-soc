@@ -818,71 +818,186 @@ fn now_unix() -> u64 {
         .as_secs()
 }
 
-const ADMIN_HTML: &str = r#"<!doctype html>
+const ADMIN_HTML: &str = r##"<!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>WAF IDS AI SOC</title>
-  <style>
-    body { margin: 0; font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #f7f8fa; color: #18202a; }
-    header { padding: 20px 28px; background: #14213d; color: white; }
-    main { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; padding: 20px; }
-    section { background: white; border: 1px solid #d9dee7; border-radius: 8px; padding: 16px; min-height: 180px; }
-    h1 { font-size: 20px; margin: 0; }
-    h2 { font-size: 15px; margin: 0 0 10px; }
-    pre { white-space: pre-wrap; word-break: break-word; font-size: 12px; line-height: 1.4; }
-    .metric { font-size: 28px; font-weight: 700; }
-  </style>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WAF IDS AI SOC — Console</title>
+<style>
+:root{
+  --brand:#14213d;--canvas:#f7f8fa;--surface:#ffffff;--border:#d9dee7;
+  --ink:#18202a;--sub:#667085;--on-brand:#ffffff;
+  --pass:#1a7f37;--fail:#b3261e;--warn:#9a6700;
+  --pass-bg:#e6f4ea;--fail-bg:#fce8e6;--warn-bg:#fff4e5;--brand-bg:#eef1f6;
+  --radius:8px;--fs-h1:20px;--fs-h2:15px;--fs-body:14px;--fs-cap:12px;--fs-metric:28px;
+}
+:root[data-theme=hc]{
+  --brand:#000000;--canvas:#ffffff;--surface:#ffffff;--border:#000000;
+  --ink:#000000;--sub:#1c1c1c;--on-brand:#ffffff;
+  --pass:#0a5c22;--fail:#8a1c14;--warn:#5a3d00;
+  --pass-bg:#ffffff;--fail-bg:#ffffff;--warn-bg:#ffffff;--brand-bg:#ffffff;
+}
+*{box-sizing:border-box}
+body{margin:0;font-family:ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:var(--canvas);color:var(--ink);font-size:var(--fs-body);line-height:1.5}
+a.skip{position:absolute;left:-9999px;top:0;background:var(--brand);color:var(--on-brand);padding:10px 16px;z-index:30;border-radius:0 0 6px 0}
+a.skip:focus{left:0}
+header.app{display:flex;align-items:center;gap:16px;padding:16px 24px;background:var(--brand);color:var(--on-brand)}
+header.app h1{font-size:var(--fs-h1);margin:0;font-weight:600;flex:1}
+.toolbar{display:flex;gap:8px}
+button{font:inherit;min-height:44px;padding:0 16px;border-radius:6px;border:1px solid transparent;cursor:pointer;display:inline-flex;align-items:center;gap:6px}
+button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible,summary:focus-visible{outline:2px solid #4c8dff;outline-offset:2px}
+.btn-primary{background:var(--brand);color:var(--on-brand);border-color:var(--brand)}
+.btn-ghost{background:transparent;color:var(--on-brand);border-color:rgba(255,255,255,.45)}
+:root[data-theme=hc] .btn-ghost{border-color:var(--on-brand)}
+.btn-secondary{background:var(--surface);color:var(--ink);border-color:var(--border)}
+button[aria-pressed=true]{background:var(--on-brand);color:var(--brand)}
+main{padding:20px;max-width:1600px;margin:0 auto}
+.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:16px;margin-bottom:20px}
+.tile{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:16px}
+.tile .label{font-size:var(--fs-cap);color:var(--sub);text-transform:uppercase;letter-spacing:.04em}
+.tile .metric{font-size:var(--fs-metric);font-weight:700;margin-top:4px;word-break:break-word}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:16px;align-items:start}
+section.card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:16px}
+section.card h2{font-size:var(--fs-h2);margin:0 0 12px}
+table{width:100%;border-collapse:collapse;font-size:13px}
+caption{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)}
+th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--border);vertical-align:top}
+th{color:var(--sub);font-weight:600;font-size:var(--fs-cap);text-transform:uppercase;letter-spacing:.03em}
+tbody tr:last-child td{border-bottom:none}
+.badge{display:inline-flex;align-items:center;gap:4px;padding:2px 8px;border-radius:999px;font-size:12px;font-weight:600;border:1px solid;white-space:nowrap}
+.badge.mono{font-family:ui-monospace,SFMono-Regular,monospace}
+.b-brand{background:var(--brand-bg);color:var(--brand);border-color:var(--brand)}
+.b-pass{background:var(--pass-bg);color:var(--pass);border-color:var(--pass)}
+.b-fail{background:var(--fail-bg);color:var(--fail);border-color:var(--fail)}
+.b-warn{background:var(--warn-bg);color:var(--warn);border-color:var(--warn)}
+.b-neutral{background:var(--canvas);color:var(--sub);border-color:var(--border)}
+dl.def{display:grid;grid-template-columns:auto 1fr;gap:8px 16px;margin:0}
+dl.def dt{color:var(--sub);font-size:13px}
+dl.def dd{margin:0;font-weight:600;text-align:right;font-size:13px;word-break:break-all}
+pre.raw{white-space:pre-wrap;word-break:break-word;font-size:12px;line-height:1.4;font-family:ui-monospace,SFMono-Regular,monospace;background:var(--canvas);border:1px solid var(--border);border-radius:6px;padding:10px;max-height:220px;overflow:auto;margin:0}
+details{margin-top:12px;border-top:1px solid var(--border);padding-top:8px}
+summary{cursor:pointer;min-height:44px;display:flex;align-items:center;color:var(--brand);font-size:13px;font-weight:600}
+form.stack{display:flex;flex-direction:column;gap:10px;margin-top:8px}
+label.field{display:flex;flex-direction:column;gap:4px;font-size:13px;color:var(--sub)}
+input,select{font:inherit;min-height:44px;padding:0 12px;border:1px solid var(--border);border-radius:6px;background:var(--surface);color:var(--ink)}
+.field-help{font-size:12px;color:var(--sub)}
+.check{flex-direction:row;align-items:center;gap:8px}
+.check input{min-height:auto;width:20px;height:20px}
+.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.muted{color:var(--sub);font-size:13px}
+.empty{color:var(--sub);font-size:13px;padding:8px 0}
+.err{color:var(--fail);font-size:13px;padding:8px 0}
+#toast{position:fixed;right:16px;bottom:16px;display:flex;flex-direction:column;gap:8px;z-index:40}
+.toast{background:var(--surface);border:1px solid var(--border);border-left-width:4px;border-radius:8px;padding:12px 16px;box-shadow:0 6px 20px rgba(20,33,61,.14);max-width:360px;font-size:13px}
+.toast.ok{border-left-color:var(--pass)}
+.toast.bad{border-left-color:var(--fail)}
+</style>
 </head>
 <body>
-  <header><h1>ContextualWisdomLab WAF/IDS/AI SOC Gateway</h1></header>
-  <main>
-    <section><h2>Routes</h2><pre id="routes">Loading</pre></section>
-    <section><h2>Threat Indicators</h2><pre id="threats">Loading</pre></section>
-    <section><h2>DNSBL Entries</h2><pre id="dnsbl">Loading</pre></section>
-    <section><h2>SOC KPIs</h2><div class="metric" id="blocked">0</div><pre id="kpis">Loading</pre></section>
-    <section><h2>Commercial Readiness</h2><pre id="readiness">Loading</pre></section>
-    <section><h2>Evidence Manifest</h2><pre id="manifest">Loading</pre></section>
-    <section><h2>License</h2><pre id="license">Loading</pre></section>
-    <section><h2>Threat Feeds</h2><pre id="feeds">Loading</pre></section>
-    <section><h2>Feed Freshness</h2><pre id="freshness">Loading</pre></section>
-    <section><h2>Recent Events</h2><pre id="events">Loading</pre></section>
-    <section><h2>Audit Logs</h2><pre id="auditLogs">Loading</pre></section>
-    <section><h2>SOC Event Export</h2><pre id="eventExport">Loading</pre></section>
-    <section><h2>DNSBL Zone</h2><pre id="zone">Loading</pre></section>
-  </main>
-  <script>
-    async function show(id, url) {
-      const res = await fetch(url);
-      const text = res.headers.get("content-type")?.includes("json")
-        ? JSON.stringify(await res.json(), null, 2)
-        : await res.text();
-      document.getElementById(id).textContent = text;
-      return text;
-    }
-    async function refresh() {
-      await Promise.all([
-        show("routes", "/api/routes"),
-        show("threats", "/api/threats"),
-        show("dnsbl", "/api/dnsbl"),
-        show("readiness", "/api/commercial/readiness"),
-        show("manifest", "/api/commercial/evidence-manifest"),
-        show("license", "/api/commercial/license"),
-        show("feeds", "/api/threat-feeds"),
-        show("freshness", "/api/threat-feeds/freshness"),
-        show("events", "/api/events"),
-        show("auditLogs", "/api/audit-logs"),
-        show("eventExport", "/api/events.ndjson"),
-        show("zone", "/dnsbl/zone"),
-      ]);
-      const kpiText = await show("kpis", "/api/kpis");
-      document.getElementById("blocked").textContent = JSON.parse(kpiText).blocked_event_count;
-    }
-    refresh();
-  </script>
+<a class="skip" href="#main">Skip to content</a>
+<header class="app">
+  <h1>ContextualWisdomLab WAF/IDS/AI SOC Gateway</h1>
+  <div class="toolbar">
+    <button class="btn-ghost" id="hcToggle" aria-pressed="false">High contrast</button>
+    <button class="btn-ghost" id="refreshBtn">Refresh</button>
+  </div>
+</header>
+<main id="main">
+  <div class="kpis" id="kpis" aria-live="polite"><div class="tile"><div class="label">Loading</div><div class="metric">…</div></div></div>
+  <div class="grid">
+    <section class="card"><h2>Routes</h2><div id="routesBody" class="muted">Loading…</div>
+      <details><summary>+ Add route</summary>
+        <form class="stack" id="routeForm">
+          <label class="field">Path prefix<input name="path_prefix" placeholder="/demo" required pattern="/.*"><span class="field-help">must start with /</span></label>
+          <label class="field">Upstream<input name="upstream" placeholder="mock://demo-upstream" required><span class="field-help">mock:// | http:// | https://</span></label>
+          <label class="field">Enforcement mode<select name="mode"><option value="monitor">Monitor</option><option value="block">Block</option></select></label>
+          <label class="field check"><input type="checkbox" name="enabled" checked> Enabled</label>
+          <label class="field">Admin token (only if server configured one)<input name="token" type="password" placeholder="X-Admin-Token" autocomplete="off"></label>
+          <div class="row"><button type="submit" class="btn-primary">Save route</button><button type="reset" class="btn-secondary">Reset</button></div>
+        </form>
+      </details>
+    </section>
+    <section class="card"><h2>Threat indicators</h2><div id="threatsBody" class="muted">Loading…</div></section>
+    <section class="card"><h2>DNSBL entries</h2><div id="dnsblBody" class="muted">Loading…</div></section>
+    <section class="card"><h2>Commercial readiness</h2><div id="readinessBody" class="muted">Loading…</div></section>
+    <section class="card"><h2>License</h2><div id="licenseBody" class="muted">Loading…</div></section>
+    <section class="card"><h2>Threat feeds</h2><div id="feedsBody" class="muted">Loading…</div></section>
+    <section class="card"><h2>Recent events</h2><div id="eventsBody" class="muted">Loading…</div></section>
+    <section class="card"><h2>Audit log</h2><div id="auditBody" class="muted">Loading…</div></section>
+    <section class="card"><h2>Evidence manifest</h2><pre class="raw" id="manifest">Loading…</pre></section>
+    <section class="card"><h2>SOC event export (ndjson)</h2><pre class="raw" id="export">Loading…</pre></section>
+    <section class="card"><h2>DNSBL zone</h2><pre class="raw" id="zone">Loading…</pre></section>
+  </div>
+</main>
+<div id="toast" aria-live="assertive"></div>
+<script>
+const $=id=>document.getElementById(id);
+const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const cap=s=>{s=String(s||'');return s.charAt(0).toUpperCase()+s.slice(1);};
+async function getJSON(u){const r=await fetch(u);if(!r.ok){let m=r.statusText;try{m=(await r.json()).error||m;}catch(e){}throw new Error(m);}return r.json();}
+async function getText(u){const r=await fetch(u);return r.text();}
+function badge(t,cls){return '<span class="badge '+cls+'">'+esc(t)+'</span>';}
+function sevBadge(s){const m={low:'b-neutral',medium:'b-warn',high:'b-fail',critical:'b-fail'};return badge(cap(s),m[String(s).toLowerCase()]||'b-neutral');}
+function modeBadge(m){return badge(cap(m),String(m).toLowerCase()==='block'?'b-fail':'b-brand');}
+function stateBadge(v){return v?badge('Enabled','b-pass'):badge('Disabled','b-neutral');}
+function statusBadge(s){const m={pass:'b-pass',fail:'b-fail',active:'b-pass',evaluation:'b-warn',unlicensed:'b-neutral',expired:'b-fail'};return badge(cap(s),m[String(s).toLowerCase()]||'b-neutral');}
+function mono(t){return '<span class="badge mono b-neutral">'+esc(t)+'</span>';}
+function table(capt,cols,rows){
+  if(!rows.length)return '<p class="empty">No entries.</p>';
+  return '<table><caption>'+esc(capt)+'</caption><thead><tr>'+cols.map(c=>'<th scope="col">'+esc(c)+'</th>').join('')+'</tr></thead><tbody>'+
+    rows.map(r=>'<tr>'+r.map(c=>'<td>'+c+'</td>').join('')+'</tr>').join('')+'</tbody></table>';
+}
+function toast(msg,ok){const d=document.createElement('div');d.className='toast '+(ok?'ok':'bad');d.textContent=msg;$('toast').appendChild(d);setTimeout(()=>d.remove(),4500);}
+async function guard(id,fn){try{await fn();}catch(e){$(id).innerHTML='<p class="err">Error: '+esc(e.message)+'</p>';}}
+async function loadKpis(){const k=await getJSON('/api/kpis');
+  const t=[['Routes',k.route_count],['Threat indicators',k.threat_indicator_count],['DNSBL entries',k.dnsbl_entry_count],['Blocked events',k.blocked_event_count],['Monitor events',k.monitor_event_count],['Gateway mode',cap(k.gateway_mode)]];
+  $('kpis').innerHTML=t.map(([l,v])=>'<div class="tile"><div class="label">'+esc(l)+'</div><div class="metric">'+esc(v)+'</div></div>').join('');}
+async function loadRoutes(){const d=await getJSON('/api/routes');
+  $('routesBody').innerHTML=table('Configured routes',['Path prefix','Upstream','Mode','State'],d.map(r=>[esc(r.path_prefix),esc(r.upstream),modeBadge(r.mode),stateBadge(r.enabled)]));}
+async function loadThreats(){const d=await getJSON('/api/threats');
+  $('threatsBody').innerHTML=table('Threat indicators',['Value','Type','Severity','Source','TTL'],d.map(t=>[mono(t.value),esc(t.indicator_type),sevBadge(t.severity),esc(t.source),esc(t.ttl_seconds)+'s']));}
+async function loadDnsbl(){const d=await getJSON('/api/dnsbl');
+  $('dnsblBody').innerHTML=table('DNSBL entries',['Address','Code','Reason','Source','TTL'],d.map(x=>[esc(x.address),mono(x.code),esc(x.reason),esc(x.source),esc(x.ttl_seconds)+'s']));}
+async function loadLicense(){const c=await getJSON('/api/commercial/license');
+  $('licenseBody').innerHTML='<dl class="def">'+
+    [['tenant_id',esc(c.tenant_id)],['deployment_id',esc(c.deployment_id)],['edition',badge(cap(c.edition),'b-brand')],['license_status',statusBadge(c.license_status)],['licensee',esc(c.licensee??'—')],['support_contact',esc(c.support_contact)],['ACV (KRW)',c.annual_contract_value_krw!=null?esc(c.annual_contract_value_krw):'—']]
+    .map(([k,v])=>'<dt>'+esc(k)+'</dt><dd>'+v+'</dd>').join('')+'</dl>';}
+async function loadReadiness(){const r=await getJSON('/api/commercial/readiness');
+  const head='<div class="row" style="margin-bottom:10px">'+badge(r.ready_for_enterprise_sale?'Ready':'Not ready',r.ready_for_enterprise_sale?'b-pass':'b-warn')+'<span class="muted">'+esc(r.readiness_level)+'</span></div>';
+  const checks=(r.checks||[]).map(c=>'<div class="row" style="margin:6px 0">'+statusBadge(c.status)+'<span class="muted">'+esc(c.id)+' — '+esc(c.evidence)+'</span></div>').join('');
+  $('readinessBody').innerHTML=head+checks;}
+async function loadFeeds(){const f=await getJSON('/api/threat-feeds/freshness');
+  $('feedsBody').innerHTML=table('Threat feeds',['Feed','Source','Threats','DNSBL','Freshness'],f.map(x=>[esc(x.feed_id),esc(x.source),esc(x.threat_count),esc(x.dnsbl_count),x.stale?badge('Stale','b-fail'):badge('Fresh','b-pass')]));}
+async function loadEvents(){const e=await getJSON('/api/events');
+  $('eventsBody').innerHTML=table('Recent events',['ID','Client IP','Action','Score','Path'],e.slice(0,25).map(x=>[esc(x.id),esc(x.client_ip??'—'),esc(x.action),esc(x.score),esc(x.path)]));}
+async function loadAudit(){const a=await getJSON('/api/audit-logs');
+  $('auditBody').innerHTML=table('Audit log',['Actor','Action','Resource','Resource ID','Outcome'],a.slice(0,25).map(x=>[esc(x.actor),esc(x.action),esc(x.resource),esc(x.resource_id),esc(x.outcome)]));}
+async function loadRaw(id,url,json){try{const t=json?JSON.stringify(await getJSON(url),null,2):await getText(url);$(id).textContent=t&&t.trim()?t:'(empty)';}catch(e){$(id).textContent='Error: '+e.message;}}
+async function refresh(){await Promise.allSettled([
+  guard('kpis',loadKpis),guard('routesBody',loadRoutes),guard('threatsBody',loadThreats),guard('dnsblBody',loadDnsbl),
+  guard('licenseBody',loadLicense),guard('readinessBody',loadReadiness),guard('feedsBody',loadFeeds),
+  guard('eventsBody',loadEvents),guard('auditBody',loadAudit),
+  loadRaw('manifest','/api/commercial/evidence-manifest',true),loadRaw('export','/api/events.ndjson',false),loadRaw('zone','/dnsbl/zone',false)]);}
+$('routeForm').addEventListener('submit',async ev=>{ev.preventDefault();
+  const fd=new FormData(ev.target);const pp=(fd.get('path_prefix')||'').trim();
+  const body={id:pp.replace(/^\//,'').replace(/[^a-zA-Z0-9_-]/g,'-')||'route',path_prefix:pp,upstream:(fd.get('upstream')||'').trim(),mode:fd.get('mode'),enabled:fd.get('enabled')==='on'};
+  const token=(fd.get('token')||'').trim();
+  try{const h={'content-type':'application/json'};if(token)h['x-admin-token']=token;
+    const r=await fetch('/api/routes',{method:'POST',headers:h,body:JSON.stringify(body)});
+    if(!r.ok){let m=r.statusText;try{m=(await r.json()).error||m;}catch(e){}throw new Error(m);}
+    toast('Route saved: '+pp,true);ev.target.reset();guard('routesBody',loadRoutes);guard('kpis',loadKpis);
+  }catch(e){toast('Save failed: '+e.message,false);}});
+const root=document.documentElement;
+if(localStorage.getItem('waf-theme')==='hc')root.dataset.theme='hc';
+function syncHc(){$('hcToggle').setAttribute('aria-pressed',root.dataset.theme==='hc'?'true':'false');}
+syncHc();
+$('hcToggle').addEventListener('click',()=>{const on=root.dataset.theme==='hc';if(on){delete root.dataset.theme;}else{root.dataset.theme='hc';}localStorage.setItem('waf-theme',on?'':'hc');syncHc();});
+$('refreshBtn').addEventListener('click',refresh);
+refresh();
+</script>
 </body>
-</html>"#;
+</html>"##;
 
 #[cfg(test)]
 mod tests {
