@@ -17,13 +17,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let rate_limit = parse_u32_env("RATE_LIMIT", 0)?;
     let rate_limit_window = parse_u64_env("RATE_LIMIT_WINDOW", 60)?;
     let admin_tokens = parse_admin_tokens(&env::var("ADMIN_TOKENS").unwrap_or_default());
+    let max_body_bytes = parse_u64_env("MAX_BODY_BYTES", 1_048_576)? as usize;
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
     println!("waf-ids-ai-soc listening on http://{bind_addr}");
     let state = AppState::load(config)
         .await
         .map_err(|message| io::Error::new(io::ErrorKind::InvalidData, message))?
         .with_rate_limit(rate_limit, rate_limit_window)
-        .with_admin_tokens(admin_tokens);
+        .with_admin_tokens(admin_tokens)
+        .with_max_body_size(max_body_bytes);
     axum::serve(listener, build_app(state)).await?;
     Ok(())
 }

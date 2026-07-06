@@ -1,7 +1,7 @@
 use axum::{
     Json, Router,
     body::Bytes,
-    extract::State,
+    extract::{DefaultBodyLimit, State},
     http::{HeaderMap, Method, StatusCode, Uri},
     response::{Html, IntoResponse, Response},
     routing::{any, get, post},
@@ -52,6 +52,8 @@ pub struct AppState {
     rate_limiter: Arc<Mutex<HashMap<IpAddr, (u64, u32)>>>,
     rate_limit: u32,
     rate_limit_window: u64,
+    // Max accepted request body size in bytes; oversized requests get 413.
+    max_body_bytes: usize,
 }
 
 impl AppState {
@@ -85,7 +87,15 @@ impl AppState {
             rate_limiter: Arc::new(Mutex::new(HashMap::new())),
             rate_limit: 0,
             rate_limit_window: 60,
+            max_body_bytes: 1_048_576,
         }
+    }
+
+    /// Set the maximum accepted request body size in bytes; larger requests are
+    /// rejected with 413 before the handler runs. Builder-style.
+    pub fn with_max_body_size(mut self, max_body_bytes: usize) -> Self {
+        self.max_body_bytes = max_body_bytes;
+        self
     }
 
     /// Enable per-client-IP rate limiting: at most `limit` gateway requests per
@@ -295,6 +305,7 @@ struct ErrorBody {
 }
 
 pub fn build_app(state: AppState) -> Router {
+    let max_body_bytes = state.max_body_bytes;
     Router::new()
         .route("/", get(admin_console))
         .route("/admin", get(admin_console))
@@ -322,6 +333,7 @@ pub fn build_app(state: AppState) -> Router {
         .route("/api/support-bundle", get(support_bundle))
         .route("/dnsbl/zone", get(dnsbl_zone))
         .route("/gateway/{*path}", any(gateway))
+        .layer(DefaultBodyLimit::max(max_body_bytes))
         .with_state(state)
 }
 
@@ -1229,6 +1241,33 @@ mod tests {
 
     async fn json_body<T: DeserializeOwned>(response: Response) -> T {
         serde_json::from_str(&body_text(response).await).unwrap()
+    }
+
+    #[tokio::test]
+    async fn oversized_request_body_is_rejected() {
+        let app = build_app(AppState::seeded(None).with_max_body_size(16));
+
+        // A body over the limit is rejected with 413 before the handler runs.
+        let big = Request::builder()
+            .method(Method::POST)
+            .uri("/gateway/demo")
+            .body(Body::from("x".repeat(64)))
+            .unwrap();
+        assert_eq!(
+            app_request(&app, big).await.status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+
+        // A body within the limit is accepted and routed normally.
+        let small = Request::builder()
+            .method(Method::POST)
+            .uri("/gateway/demo")
+            .body(Body::from("x"))
+            .unwrap();
+        assert_ne!(
+            app_request(&app, small).await.status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
     }
 
     #[test]
