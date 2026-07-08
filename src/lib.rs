@@ -3841,6 +3841,10 @@ mod tests {
         let good = serde_json::json!({"choices":[{"message":{"content":"verdict"}}]});
         assert_eq!(soc_llm_extract_content(&good).unwrap(), "verdict");
         assert!(soc_llm_extract_content(&serde_json::json!({})).is_none());
+        // Empty `choices` array: the first-element lookup must short-circuit to None.
+        assert!(soc_llm_extract_content(&serde_json::json!({"choices":[]})).is_none());
+        // A choice with no `message` object must short-circuit to None.
+        assert!(soc_llm_extract_content(&serde_json::json!({"choices":[{}]})).is_none());
         assert!(
             soc_llm_extract_content(&serde_json::json!({"choices":[{"message":{}}]})).is_none()
         );
