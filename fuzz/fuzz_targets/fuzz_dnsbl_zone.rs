@@ -42,6 +42,7 @@ fuzz_target!(|input: Input| {
             reason: e.reason,
             source: e.source,
             ttl_seconds: e.ttl,
+            prefix_len: None,
         })
         .collect();
 
