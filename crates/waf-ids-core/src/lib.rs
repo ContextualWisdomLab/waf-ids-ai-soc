@@ -33,6 +33,7 @@ impl AppData {
                 upstream: "mock://demo-upstream".to_string(),
                 mode: EnforcementMode::Monitor,
                 enabled: true,
+                block_threshold: None,
             }],
             threats: vec![ThreatIndicator {
                 value: "union select".to_string(),
@@ -47,6 +48,7 @@ impl AppData {
                 reason: "seed malicious scanner".to_string(),
                 source: "seed:dnsbl".to_string(),
                 ttl_seconds: 300,
+                prefix_len: None,
             }],
             events: Vec::new(),
             next_event_id: 1,
@@ -102,6 +104,10 @@ pub struct RouteConfig {
     pub upstream: String,
     pub mode: EnforcementMode,
     pub enabled: bool,
+    /// Per-route score at/above which a Block-mode route blocks. `None` uses the
+    /// global [`BLOCK_SCORE`], letting operators tune sensitivity per endpoint.
+    #[serde(default)]
+    pub block_threshold: Option<u16>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -120,6 +126,10 @@ pub struct DnsblEntry {
     pub reason: String,
     pub source: String,
     pub ttl_seconds: u64,
+    /// Optional CIDR prefix length. `None` is an exact-address entry; `Some(n)`
+    /// makes `address` the base of an `/n` network so a whole subnet is listed.
+    #[serde(default)]
+    pub prefix_len: Option<u8>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -331,6 +341,9 @@ pub fn validate_route(route: &RouteConfig) -> Result<(), &'static str> {
     {
         return Err("route upstream must start with mock://, http://, or https://");
     }
+    if route.block_threshold == Some(0) {
+        return Err("route block_threshold must be greater than 0");
+    }
     Ok(())
 }
 
@@ -360,11 +373,53 @@ pub fn validate_dnsbl(entry: &DnsblEntry) -> Result<(), &'static str> {
     if entry.ttl_seconds == 0 {
         return Err("DNSBL ttl_seconds must be greater than 0");
     }
+    if let Some(prefix) = entry.prefix_len {
+        let max = if entry.address.is_ipv4() { 32 } else { 128 };
+        if prefix > max {
+            return Err("DNSBL prefix_len exceeds the address family width");
+        }
+    }
     match IpAddr::from_str(&entry.code) {
         Ok(IpAddr::V4(address)) if address.octets()[0] == 127 => Ok(()),
         Ok(IpAddr::V4(_)) => Err("DNSBL response code must be in 127.0.0.0/8"),
         Ok(IpAddr::V6(_)) => Err("DNSBL response code must be an IPv4 loopback address"),
         Err(_) => Err("DNSBL response code must be an IP address"),
+    }
+}
+
+/// True if `ip` matches a DNSBL `entry`: an exact address match when
+/// `prefix_len` is `None`, otherwise a CIDR network-prefix match. Mixed
+/// IPv4/IPv6 families never match.
+pub fn dnsbl_matches(entry: &DnsblEntry, ip: IpAddr) -> bool {
+    match entry.prefix_len {
+        None => entry.address == ip,
+        Some(prefix) => ip_in_network(entry.address, prefix, ip),
+    }
+}
+
+/// True if `ip` falls within the `network`/`prefix_len` CIDR block. No
+/// dependency — plain bit masking. Mixed address families never match.
+pub fn ip_in_network(network: IpAddr, prefix_len: u8, ip: IpAddr) -> bool {
+    match (network, ip) {
+        (IpAddr::V4(net), IpAddr::V4(addr)) => {
+            let bits = prefix_len.min(32);
+            let mask = if bits == 0 {
+                0
+            } else {
+                u32::MAX << (32 - bits)
+            };
+            (u32::from(net) & mask) == (u32::from(addr) & mask)
+        }
+        (IpAddr::V6(net), IpAddr::V6(addr)) => {
+            let bits = prefix_len.min(128);
+            let mask = if bits == 0 {
+                0
+            } else {
+                u128::MAX << (128 - bits)
+            };
+            (u128::from(net) & mask) == (u128::from(addr) & mask)
+        }
+        _ => false,
     }
 }
 
@@ -683,26 +738,83 @@ pub fn builtin_signatures() -> &'static [BuiltinSignature] {
     SIGS
 }
 
+/// A redacted view of a built-in signature for the public catalog. Intentionally
+/// omits the raw match `pattern` so the catalog does not hand attackers the exact
+/// evasion strings.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SignatureInfo {
+    pub id: String,
+    pub class: String,
+    pub severity: Severity,
+}
+
+/// The built-in signature catalog (id, class, severity) for operator and buyer
+/// review of out-of-the-box detection coverage. Patterns are deliberately not
+/// exposed.
+pub fn signature_catalog() -> Vec<SignatureInfo> {
+    builtin_signatures()
+        .iter()
+        .map(|sig| SignatureInfo {
+            id: sig.id.to_string(),
+            class: sig.class.to_string(),
+            severity: sig.severity.clone(),
+        })
+        .collect()
+}
+
 /// A lightweight behavioral anomaly heuristic (not ML): flags requests whose
 /// decoded payload has an unusually high density of shell/markup metacharacters.
 /// This is the first-tier "AI SOC" behavioral signal — intentionally conservative
 /// so ordinary requests never trip it. Returns `(score_contribution, reason)`.
 pub fn anomaly_signal(haystack: &str) -> Option<(u16, String)> {
+    let mut score = 0u16;
+    let mut reasons = Vec::new();
+
+    // Signal 1: shell/markup metacharacter density.
     const META: &str = "<>'\"();|&$`";
     let suspicious = haystack.chars().filter(|c| META.contains(*c)).count();
-    let len = haystack.chars().count().max(1);
-    let ratio = suspicious as f64 / len as f64;
+    let ratio = suspicious as f64 / haystack.chars().count().max(1) as f64;
     if suspicious >= 6 && ratio >= 0.08 {
-        Some((
-            15,
-            format!(
-                "anomaly heuristic: {suspicious} metacharacters ({:.0}% density)",
-                ratio * 100.0
-            ),
-        ))
-    } else {
-        None
+        score += 15;
+        reasons.push(format!(
+            "{suspicious} metacharacters ({:.0}% density)",
+            ratio * 100.0
+        ));
     }
+
+    // Signal 2: high Shannon entropy over a non-trivial payload — a marker of
+    // encoded/obfuscated content (base64 blobs, packed exploit strings) that
+    // signature matching misses. Length-gated so short requests never trip it.
+    if haystack.len() >= 40 {
+        let entropy = shannon_entropy(haystack.as_bytes());
+        if entropy >= 4.5 {
+            score += 10;
+            reasons.push(format!("high entropy {entropy:.1} bits/byte"));
+        }
+    }
+
+    if score == 0 {
+        None
+    } else {
+        Some((score, format!("anomaly heuristic: {}", reasons.join("; "))))
+    }
+}
+
+/// Shannon entropy in bits per byte of a non-empty byte slice.
+fn shannon_entropy(bytes: &[u8]) -> f64 {
+    let mut counts = [0u32; 256];
+    for &byte in bytes {
+        counts[byte as usize] += 1;
+    }
+    let total = bytes.len() as f64;
+    counts
+        .iter()
+        .filter(|&&count| count > 0)
+        .map(|&count| {
+            let p = count as f64 / total;
+            -p * p.log2()
+        })
+        .sum()
 }
 
 pub fn score_request(
@@ -741,7 +853,7 @@ pub fn score_request(
 
     // DNSBL client reputation.
     if let Some(ip) = client_ip
-        && let Some(entry) = dnsbl.iter().find(|entry| entry.address == ip)
+        && let Some(entry) = dnsbl.iter().find(|entry| dnsbl_matches(entry, ip))
     {
         score += 100;
         reasons.push(format!(
@@ -1279,6 +1391,7 @@ mod tests {
                 reason: "scanner".to_string(),
                 source: "unit".to_string(),
                 ttl_seconds: 300,
+                prefix_len: None,
             }],
         );
         assert!(zone.starts_with("$ORIGIN "));
@@ -1300,6 +1413,7 @@ mod tests {
                 reason: "back\\slash and \"quote\"".to_string(),
                 source: "unit".to_string(),
                 ttl_seconds: 300,
+                prefix_len: None,
             }],
         );
         assert!(zone.contains("10.2.0.192 IN TXT \"back\\\\slash and \\\"quote\\\" source=unit\""));
@@ -1319,6 +1433,7 @@ mod tests {
                     reason: "scanner".to_string(),
                     source: "unit".to_string(),
                     ttl_seconds: 300,
+                    prefix_len: None,
                 },
                 DnsblEntry {
                     address: "192.0.2.20".parse().unwrap(),
@@ -1326,6 +1441,7 @@ mod tests {
                     reason: "ok".to_string(),
                     source: "unit".to_string(),
                     ttl_seconds: 300,
+                    prefix_len: None,
                 },
             ],
         );
@@ -1347,6 +1463,7 @@ mod tests {
                 reason: "line1\n10.2.0.192 IN TXT \"break".to_string(),
                 source: "unit".to_string(),
                 ttl_seconds: 300,
+                prefix_len: None,
             }],
         );
         // No raw newline survives inside the TXT payload: the whole record,
@@ -1364,6 +1481,30 @@ mod tests {
             sanitize_zone_origin("dnsbl_feed.example-1"),
             "dnsbl_feed.example-1"
         );
+    }
+
+    #[test]
+    fn anomaly_signal_flags_metacharacters_and_entropy() {
+        // Metacharacter density on a short payload (entropy check length-gated out).
+        let (score, reason) = anomaly_signal("a<b>c'd\"e(f)g;h|i&j").unwrap();
+        assert_eq!(score, 15);
+        assert!(reason.contains("metacharacters"));
+
+        // High-entropy encoded blob (40+ bytes, no metacharacters).
+        let blob = "aGVsbG8Xd29ybGQ0Zm9vYmFyMTIzNDU2Nzg5MDBhYmNkZWZn";
+        let (score, reason) = anomaly_signal(blob).unwrap();
+        assert_eq!(score, 10);
+        assert!(reason.contains("entropy"));
+
+        // Long but low-entropy (repeated byte) and ordinary short text: not flagged.
+        assert!(anomaly_signal(&"a".repeat(60)).is_none());
+        assert!(anomaly_signal("/account/profile?tab=settings").is_none());
+    }
+
+    #[test]
+    fn shannon_entropy_ranges_from_zero_to_high() {
+        assert_eq!(shannon_entropy(b"aaaaaaaa"), 0.0);
+        assert!(shannon_entropy(b"abcdefgh") > 2.9);
     }
 
     #[test]

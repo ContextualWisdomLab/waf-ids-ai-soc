@@ -42,6 +42,7 @@ fn dnsbl_strategy() -> impl Strategy<Value = DnsblEntry> {
             reason,
             source,
             ttl_seconds,
+            prefix_len: None,
         },
     )
 }

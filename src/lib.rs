@@ -1,7 +1,7 @@
 use axum::{
     Json, Router,
     body::Bytes,
-    extract::{Path as PathParam, State},
+    extract::{DefaultBodyLimit, Path as PathParam, Query, State},
     http::{HeaderMap, Method, StatusCode, Uri},
     response::{Html, IntoResponse, Response},
     routing::{any, get, post},
@@ -22,17 +22,17 @@ use tokio::{
 use waf_ids_core::{
     AppData, BLOCK_SCORE, buyer_evidence_manifest_at, commercial_readiness_snapshot_at,
     enforce_event_limit, kpi_snapshot_at, prometheus_exposition, rate_limit_step, record_audit_log,
-    select_route, threat_feed_freshness_snapshot, upsert_dnsbl, upsert_route, upsert_threat,
-    upsert_threat_feed, validate_commercial_profile, validate_dnsbl, validate_route,
+    select_route, signature_catalog, threat_feed_freshness_snapshot, upsert_dnsbl, upsert_route,
+    upsert_threat, upsert_threat_feed, validate_commercial_profile, validate_dnsbl, validate_route,
     validate_threat, validate_threat_feed_import,
 };
 pub use waf_ids_core::{
     AuditLogEntry, BuyerEvidenceEndpoint, BuyerEvidenceManifest, BuyerEvidenceRuntimeCounts,
     CommercialProfile, CommercialReadiness, DnsblEntry, EnforcementMode, LicenseStatus,
     NewAuditLogEntry, ProductEdition, ReadinessCheck, ReadinessStatus, RouteConfig, ScoredRequest,
-    SecurityEvent, Severity, SocKpiSnapshot, TARGET_SALE_VALUE_KRW, ThreatFeedFreshness,
-    ThreatFeedImport, ThreatFeedImportResult, ThreatFeedStatus, ThreatIndicator, export_dnsbl_zone,
-    reverse_ipv4_for_dnsbl, score_request,
+    SecurityEvent, Severity, SignatureInfo, SocKpiSnapshot, TARGET_SALE_VALUE_KRW,
+    ThreatFeedFreshness, ThreatFeedImport, ThreatFeedImportResult, ThreatFeedStatus,
+    ThreatIndicator, export_dnsbl_zone, ip_in_network, reverse_ipv4_for_dnsbl, score_request,
 };
 
 #[derive(Clone)]
@@ -52,6 +52,8 @@ pub struct AppState {
     rate_limiter: Arc<Mutex<HashMap<IpAddr, (u64, u32)>>>,
     rate_limit: u32,
     rate_limit_window: u64,
+    // Max accepted request body size in bytes; oversized requests get 413.
+    max_body_bytes: usize,
     // Optional Clearfolio document-viewer integration. `None` unless configured.
     clearfolio: Option<ClearfolioConfig>,
     // Optional LLM SOC-analysis backend (OpenAI-compatible, e.g. the
@@ -113,9 +115,17 @@ impl AppState {
             rate_limiter: Arc::new(Mutex::new(HashMap::new())),
             rate_limit: 0,
             rate_limit_window: 60,
+            max_body_bytes: 1_048_576,
             clearfolio: None,
             soc_llm: None,
         }
+    }
+
+    /// Set the maximum accepted request body size in bytes; larger requests are
+    /// rejected with 413 before the handler runs. Builder-style.
+    pub fn with_max_body_size(mut self, max_body_bytes: usize) -> Self {
+        self.max_body_bytes = max_body_bytes;
+        self
     }
 
     /// Enable the Clearfolio document-viewer integration. `None` disables it
@@ -339,10 +349,13 @@ struct ErrorBody {
 }
 
 pub fn build_app(state: AppState) -> Router {
+    let max_body_bytes = state.max_body_bytes;
     Router::new()
         .route("/", get(admin_console))
         .route("/admin", get(admin_console))
         .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
+        .route("/api/version", get(version))
         .route("/api/routes", get(list_routes).post(create_route))
         .route("/api/threats", get(list_threats).post(create_threat))
         .route("/api/dnsbl", get(list_dnsbl).post(create_dnsbl))
@@ -350,6 +363,8 @@ pub fn build_app(state: AppState) -> Router {
         .route("/api/audit-logs", get(list_audit_logs))
         .route("/api/events.ndjson", get(events_ndjson))
         .route("/api/kpis", get(kpis))
+        .route("/api/signatures", get(list_signatures))
+        .route("/api/evaluate", post(evaluate_request))
         .route("/metrics", get(metrics))
         .route(
             "/api/commercial/license",
@@ -371,6 +386,7 @@ pub fn build_app(state: AppState) -> Router {
         .route("/api/support-bundle", get(support_bundle))
         .route("/dnsbl/zone", get(dnsbl_zone))
         .route("/gateway/{*path}", any(gateway))
+        .layer(DefaultBodyLimit::max(max_body_bytes))
         .with_state(state)
 }
 
@@ -667,6 +683,37 @@ async fn healthz(State(state): State<AppState>) -> Json<HealthStatus> {
     Json(state.health_status())
 }
 
+/// Build/version metadata for deployment verification.
+async fn version() -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "name": env!("CARGO_PKG_NAME"),
+        "version": env!("CARGO_PKG_VERSION"),
+    }))
+}
+
+/// Kubernetes readiness probe: distinct from `/healthz` (liveness), it reports
+/// whether the gateway is configured to serve — i.e. has an enabled route.
+async fn readyz(State(state): State<AppState>) -> Response {
+    let routes_enabled = {
+        let data = state.inner.read().await;
+        data.routes.iter().filter(|route| route.enabled).count()
+    };
+    let ready = routes_enabled > 0;
+    let status = if ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (
+        status,
+        Json(serde_json::json!({
+            "ready": ready,
+            "routes_enabled": routes_enabled,
+        })),
+    )
+        .into_response()
+}
+
 async fn admin_console() -> Html<&'static str> {
     Html(ADMIN_HTML)
 }
@@ -773,8 +820,35 @@ async fn create_dnsbl(
     }
 }
 
-async fn list_events(State(state): State<AppState>) -> Json<Vec<SecurityEvent>> {
-    Json(state.inner.read().await.events.clone())
+#[derive(Deserialize)]
+struct EventQuery {
+    #[serde(default)]
+    action: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+/// Lists security events, optionally filtered by `action` and capped to the most
+/// recent `limit` (chronological order preserved) for SOC triage.
+async fn list_events(
+    State(state): State<AppState>,
+    Query(query): Query<EventQuery>,
+) -> Json<Vec<SecurityEvent>> {
+    let data = state.inner.read().await;
+    let mut events: Vec<SecurityEvent> = match &query.action {
+        Some(action) => data
+            .events
+            .iter()
+            .filter(|event| &event.action == action)
+            .cloned()
+            .collect(),
+        None => data.events.clone(),
+    };
+    if let Some(limit) = query.limit {
+        let start = events.len().saturating_sub(limit);
+        events.drain(..start);
+    }
+    Json(events)
 }
 
 async fn list_audit_logs(State(state): State<AppState>) -> Json<Vec<AuditLogEntry>> {
@@ -784,6 +858,50 @@ async fn list_audit_logs(State(state): State<AppState>) -> Json<Vec<AuditLogEntr
 async fn kpis(State(state): State<AppState>) -> Json<SocKpiSnapshot> {
     let data = state.inner.read().await;
     Json(kpi_snapshot_at(&data, now_unix()))
+}
+
+async fn list_signatures() -> Json<Vec<SignatureInfo>> {
+    Json(signature_catalog())
+}
+
+#[derive(Deserialize)]
+struct EvaluateRequest {
+    path: String,
+    #[serde(default)]
+    query: Option<String>,
+    #[serde(default)]
+    body: Option<String>,
+    #[serde(default)]
+    client_ip: Option<IpAddr>,
+}
+
+#[derive(Serialize)]
+struct EvaluateResponse {
+    score: u16,
+    reason: String,
+    would_block: bool,
+}
+
+/// Scores a synthetic request against the current detection state without
+/// proxying it, so operators can test payloads and tune rules offline.
+async fn evaluate_request(
+    State(state): State<AppState>,
+    Json(request): Json<EvaluateRequest>,
+) -> Json<EvaluateResponse> {
+    let data = state.inner.read().await;
+    let scored = score_request(
+        &request.path,
+        request.query.as_deref(),
+        request.body.as_deref().unwrap_or(""),
+        request.client_ip,
+        &data.threats,
+        &data.dnsbl,
+    );
+    Json(EvaluateResponse {
+        would_block: scored.score >= BLOCK_SCORE,
+        score: scored.score,
+        reason: scored.reason,
+    })
 }
 
 async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
@@ -1030,7 +1148,9 @@ async fn gateway(
         &dnsbl,
     );
 
-    if route.mode == EnforcementMode::Block && scored.score >= BLOCK_SCORE {
+    if route.mode == EnforcementMode::Block
+        && scored.score >= route.block_threshold.unwrap_or(BLOCK_SCORE)
+    {
         record_event(
             &state,
             client_ip,
@@ -1167,7 +1287,7 @@ async fn record_event(
         .mutate_and_persist(|data| {
             let id = data.next_event_id;
             data.next_event_id += 1;
-            data.events.push(SecurityEvent {
+            let event = SecurityEvent {
                 id,
                 timestamp_unix: now_unix(),
                 client_ip,
@@ -1176,13 +1296,24 @@ async fn record_event(
                 reason,
                 score,
                 path,
-            });
+            };
+            // Structured stdout log line for SIEM / log-collector ingestion.
+            // ponytail: one println per recorded event — fine at gateway volumes;
+            // add async batching if event throughput ever becomes a bottleneck.
+            println!("{}", security_event_log_line(&event));
+            data.events.push(event);
             enforce_event_limit(data, event_limit);
         })
         .await
     {
         eprintln!("failed to persist security event: {error}");
     }
+}
+
+/// Serializes a [`SecurityEvent`] as a single-line JSON record for structured
+/// stdout logging (SIEM / log-collector ingestion).
+fn security_event_log_line(event: &SecurityEvent) -> String {
+    serde_json::to_string(event).expect("SecurityEvent is JSON-serializable")
 }
 
 fn admin_authorized(state: &AppState, headers: &HeaderMap) -> bool {
@@ -1641,6 +1772,11 @@ pub async fn run_from_env(
         60,
     )?;
     let admin_tokens = parse_admin_tokens(&std::env::var("ADMIN_TOKENS").unwrap_or_default());
+    let max_body_bytes = parse_u64_env(
+        "MAX_BODY_BYTES",
+        std::env::var("MAX_BODY_BYTES").ok().as_deref(),
+        1_048_576,
+    )? as usize;
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
     let local_addr = listener.local_addr()?;
     println!("waf-ids-ai-soc listening on http://{local_addr}");
@@ -1651,7 +1787,8 @@ pub async fn run_from_env(
         .await
         .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidData, message))?
         .with_rate_limit(rate_limit, rate_limit_window)
-        .with_admin_tokens(admin_tokens);
+        .with_admin_tokens(admin_tokens)
+        .with_max_body_size(max_body_bytes);
     let served = axum::serve(listener, build_app(state))
         .with_graceful_shutdown(shutdown)
         .await;
@@ -1693,6 +1830,7 @@ mod tests {
             "EVENT_LIMIT",
             "RATE_LIMIT",
             "RATE_LIMIT_WINDOW",
+            "MAX_BODY_BYTES",
         ] {
             unsafe { std::env::remove_var(name) };
         }
@@ -1772,6 +1910,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_from_env_rejects_malformed_max_body_bytes() {
+        let _guard = ENV_GUARD.lock().await;
+        clear_run_env();
+        unsafe {
+            std::env::set_var("BIND_ADDR", "127.0.0.1:0");
+            std::env::set_var("MAX_BODY_BYTES", "not-a-number");
+        }
+        assert!(
+            run_from_env(Box::pin(std::future::ready(())))
+                .await
+                .is_err()
+        );
+        clear_run_env();
+    }
+
+    #[tokio::test]
     async fn run_from_env_surfaces_state_load_failure() {
         let _guard = ENV_GUARD.lock().await;
         clear_run_env();
@@ -1802,6 +1956,7 @@ mod tests {
             upstream: "https://origin.example".to_string(),
             mode: EnforcementMode::Block,
             enabled: true,
+            block_threshold: None,
         }
     }
 
@@ -1844,6 +1999,7 @@ mod tests {
                 reason: "feed scanner".to_string(),
                 source: "misp-seoul".to_string(),
                 ttl_seconds: 600,
+                prefix_len: None,
             }],
         }
     }
@@ -1952,6 +2108,21 @@ mod tests {
         assert!(body.contains("waf_ids_security_events_blocked"));
     }
 
+    #[tokio::test]
+    async fn signatures_endpoint_lists_redacted_catalog() {
+        let app = build_app(AppState::seeded(None));
+        let response = app_request(&app, empty_request(Method::GET, "/api/signatures")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_text(response).await;
+        // Exposes rule id, class, and severity for buyer/operator review.
+        assert!(body.contains("sqli-union-select"));
+        assert!(body.contains("\"class\":\"sqli\""));
+        assert!(body.contains("\"severity\":\"critical\"")); // the JNDI/Log4Shell rule
+        // But never the raw match patterns (which would aid evasion).
+        assert!(!body.contains("union select"));
+        assert!(!body.contains("${jndi:"));
+    }
+
     #[test]
     fn parse_admin_tokens_maps_tokens_to_actors() {
         let map = parse_admin_tokens("tokA:alice, tokB:bob ,tokC, ,:noname, tokD:");
@@ -1990,8 +2161,193 @@ mod tests {
         assert_eq!(audit_actor(&state, &named), "carol");
     }
 
+    #[test]
+    fn security_event_log_line_is_single_line_json() {
+        let event = SecurityEvent {
+            id: 7,
+            timestamp_unix: 1_700_000_000,
+            client_ip: Some("203.0.113.5".parse().unwrap()),
+            route_id: Some("app".to_string()),
+            action: "blocked".to_string(),
+            reason: "builtin sqli rule sqli-union-select".to_string(),
+            score: 100,
+            path: "/app".to_string(),
+        };
+        let line = security_event_log_line(&event);
+        assert!(!line.contains('\n'), "log line must be single-line");
+        // Round-trips as JSON with the expected fields.
+        let parsed: SecurityEvent = serde_json::from_str(&line).unwrap();
+        assert_eq!(parsed, event);
+        assert!(line.contains("\"action\":\"blocked\""));
+        assert!(line.contains("\"score\":100"));
+    }
+
     async fn json_body<T: DeserializeOwned>(response: Response) -> T {
         serde_json::from_str(&body_text(response).await).unwrap()
+    }
+
+    #[tokio::test]
+    async fn evaluate_endpoint_scores_payloads_offline() {
+        let app = build_app(AppState::seeded(None));
+        let sqli = json_request(
+            Method::POST,
+            "/api/evaluate",
+            None,
+            &serde_json::json!({"path": "/products", "query": "id=1 UNION SELECT password"}),
+        );
+        let response = app_request(&app, sqli).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = json_body(response).await;
+        assert!(body["score"].as_u64().unwrap() >= u64::from(BLOCK_SCORE));
+        assert_eq!(body["would_block"], true);
+        assert!(body["reason"].as_str().unwrap().contains("sqli"));
+        let body_req = json_request(
+            Method::POST,
+            "/api/evaluate",
+            None,
+            &serde_json::json!({"path": "/upload", "body": "x=1 union select 1"}),
+        );
+        let body: serde_json::Value = json_body(app_request(&app, body_req).await).await;
+        assert_eq!(body["would_block"], true);
+        let benign = json_request(
+            Method::POST,
+            "/api/evaluate",
+            None,
+            &serde_json::json!({"path": "/account", "query": "tab=settings"}),
+        );
+        let body: serde_json::Value = json_body(app_request(&app, benign).await).await;
+        assert_eq!(body["score"], 0);
+        assert_eq!(body["would_block"], false);
+    }
+
+    #[tokio::test]
+    async fn version_and_readiness_endpoints() {
+        let app = build_app(AppState::seeded(None));
+        let response = app_request(&app, empty_request(Method::GET, "/api/version")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = json_body(response).await;
+        assert_eq!(body["name"], env!("CARGO_PKG_NAME"));
+        assert!(!body["version"].as_str().unwrap().is_empty());
+        let response = app_request(&app, empty_request(Method::GET, "/readyz")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = json_body(response).await;
+        assert_eq!(body["ready"], true);
+        let disable = json_request(
+            Method::POST,
+            "/api/routes",
+            None,
+            &serde_json::json!({"id": "demo", "path_prefix": "/demo", "upstream": "mock://x", "mode": "monitor", "enabled": false}),
+        );
+        assert!(app_request(&app, disable).await.status().is_success());
+        let response = app_request(&app, empty_request(Method::GET, "/readyz")).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body: serde_json::Value = json_body(response).await;
+        assert_eq!(body["ready"], false);
+    }
+
+    #[tokio::test]
+    async fn events_endpoint_filters_by_action_and_limit() {
+        let app = build_app(AppState::seeded(None));
+        let route = json_request(
+            Method::POST,
+            "/api/routes",
+            None,
+            &serde_json::json!({"id": "app", "path_prefix": "/app", "upstream": "mock://x", "mode": "block", "enabled": true}),
+        );
+        assert!(app_request(&app, route).await.status().is_success());
+        app_request(
+            &app,
+            gateway_get_from_ip("/gateway/app?q=1%20UNION%20SELECT%201", "203.0.113.9"),
+        )
+        .await;
+        app_request(
+            &app,
+            gateway_get_from_ip("/gateway/demo?q=hi", "203.0.113.9"),
+        )
+        .await;
+        let all: Vec<serde_json::Value> =
+            json_body(app_request(&app, empty_request(Method::GET, "/api/events")).await).await;
+        assert_eq!(all.len(), 2);
+        let blocked: Vec<serde_json::Value> = json_body(
+            app_request(
+                &app,
+                empty_request(Method::GET, "/api/events?action=blocked"),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(blocked.len(), 1);
+        assert_eq!(blocked[0]["action"], "blocked");
+        let recent: Vec<serde_json::Value> =
+            json_body(app_request(&app, empty_request(Method::GET, "/api/events?limit=1")).await)
+                .await;
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0]["action"], "monitored");
+    }
+
+    #[tokio::test]
+    async fn per_route_block_threshold_overrides_global() {
+        let app = build_app(AppState::seeded(None));
+        let indicator = json_request(
+            Method::POST,
+            "/api/threats",
+            None,
+            &serde_json::json!({"value": "probe-xyz", "indicator_type": "test", "severity": "low", "source": "t", "ttl_seconds": 60}),
+        );
+        assert!(app_request(&app, indicator).await.status().is_success());
+        let low = json_request(
+            Method::POST,
+            "/api/routes",
+            None,
+            &serde_json::json!({"id": "low", "path_prefix": "/low", "upstream": "mock://x", "mode": "block", "enabled": true, "block_threshold": 5}),
+        );
+        assert!(app_request(&app, low).await.status().is_success());
+        let hi = json_request(
+            Method::POST,
+            "/api/routes",
+            None,
+            &serde_json::json!({"id": "hi", "path_prefix": "/hi", "upstream": "mock://x", "mode": "block", "enabled": true}),
+        );
+        assert!(app_request(&app, hi).await.status().is_success());
+        let blocked =
+            app_request(&app, empty_request(Method::GET, "/gateway/low?q=probe-xyz")).await;
+        assert_eq!(blocked.status(), StatusCode::FORBIDDEN);
+        let allowed =
+            app_request(&app, empty_request(Method::GET, "/gateway/hi?q=probe-xyz")).await;
+        assert_ne!(allowed.status(), StatusCode::FORBIDDEN);
+        let bad = json_request(
+            Method::POST,
+            "/api/routes",
+            None,
+            &serde_json::json!({"id": "z", "path_prefix": "/z", "upstream": "mock://x", "mode": "block", "enabled": true, "block_threshold": 0}),
+        );
+        assert_eq!(
+            app_request(&app, bad).await.status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_request_body_is_rejected() {
+        let app = build_app(AppState::seeded(None).with_max_body_size(16));
+        let big = Request::builder()
+            .method(Method::POST)
+            .uri("/gateway/demo")
+            .body(Body::from("x".repeat(64)))
+            .unwrap();
+        assert_eq!(
+            app_request(&app, big).await.status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+        let small = Request::builder()
+            .method(Method::POST)
+            .uri("/gateway/demo")
+            .body(Body::from("x"))
+            .unwrap();
+        assert_ne!(
+            app_request(&app, small).await.status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
     }
 
     #[tokio::test]
@@ -2048,6 +2404,7 @@ mod tests {
                     reason: "scanner".to_string(),
                     source: "unit".to_string(),
                     ttl_seconds: 300,
+                    prefix_len: None,
                 },
                 DnsblEntry {
                     address: "2001:db8::10".parse().unwrap(),
@@ -2055,6 +2412,7 @@ mod tests {
                     reason: "ipv6 skip".to_string(),
                     source: "unit".to_string(),
                     ttl_seconds: 300,
+                    prefix_len: None,
                 },
             ],
         );
@@ -2147,11 +2505,96 @@ mod tests {
                 reason: "known scanner".to_string(),
                 source: "unit".to_string(),
                 ttl_seconds: 300,
+                prefix_len: None,
             }],
         );
 
         assert_eq!(score.score, 100);
         assert!(score.reason.contains("DNSBL match"));
+    }
+
+    #[test]
+    fn ip_in_network_masks_by_prefix() {
+        let net: IpAddr = "203.0.113.0".parse().unwrap();
+        assert!(ip_in_network(net, 24, "203.0.113.200".parse().unwrap()));
+        assert!(ip_in_network(net, 24, "203.0.113.0".parse().unwrap()));
+        assert!(!ip_in_network(net, 24, "203.0.114.1".parse().unwrap()));
+        // /0 matches everything; a full /32 is an exact match.
+        assert!(ip_in_network(net, 0, "8.8.8.8".parse().unwrap()));
+        assert!(!ip_in_network(net, 32, "203.0.113.1".parse().unwrap()));
+        // Mixed address families never match.
+        assert!(!ip_in_network(net, 24, "2001:db8::1".parse().unwrap()));
+        // IPv6 prefix masking.
+        let net6: IpAddr = "2001:db8::".parse().unwrap();
+        assert!(ip_in_network(
+            net6,
+            32,
+            "2001:db8:dead:beef::1".parse().unwrap()
+        ));
+        assert!(!ip_in_network(net6, 32, "2001:db9::1".parse().unwrap()));
+        // IPv6 /0 matches everything.
+        assert!(ip_in_network(net6, 0, "fe80::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn scores_dnsbl_cidr_subnet_matches() {
+        // A /24 DNSBL entry blocks any client IP inside the subnet.
+        let entry = DnsblEntry {
+            address: "198.51.100.0".parse().unwrap(),
+            code: "127.0.0.2".to_string(),
+            reason: "botnet subnet".to_string(),
+            source: "unit".to_string(),
+            ttl_seconds: 300,
+            prefix_len: Some(24),
+        };
+        let inside = score_request(
+            "/",
+            None,
+            "",
+            Some("198.51.100.77".parse().unwrap()),
+            &[],
+            std::slice::from_ref(&entry),
+        );
+        assert_eq!(inside.score, 100);
+        assert!(inside.reason.contains("DNSBL match"));
+
+        let outside = score_request(
+            "/",
+            None,
+            "",
+            Some("198.51.101.77".parse().unwrap()),
+            &[],
+            std::slice::from_ref(&entry),
+        );
+        assert_eq!(outside.score, 0);
+    }
+
+    #[test]
+    fn validate_dnsbl_checks_prefix_len() {
+        let base = DnsblEntry {
+            address: "10.0.0.0".parse().unwrap(),
+            code: "127.0.0.2".to_string(),
+            reason: "range".to_string(),
+            source: "unit".to_string(),
+            ttl_seconds: 60,
+            prefix_len: Some(24),
+        };
+        assert!(validate_dnsbl(&base).is_ok());
+        let too_wide = DnsblEntry {
+            prefix_len: Some(40),
+            ..base.clone()
+        };
+        assert_eq!(
+            validate_dnsbl(&too_wide),
+            Err("DNSBL prefix_len exceeds the address family width")
+        );
+        // IPv6 permits prefixes up to /128.
+        let v6 = DnsblEntry {
+            address: "2001:db8::".parse().unwrap(),
+            prefix_len: Some(64),
+            ..base.clone()
+        };
+        assert!(validate_dnsbl(&v6).is_ok());
     }
 
     #[test]
@@ -2192,6 +2635,7 @@ mod tests {
                 upstream: "mock://admin".to_string(),
                 mode: EnforcementMode::Monitor,
                 enabled: true,
+                block_threshold: None,
             },
         ];
 
@@ -2229,6 +2673,7 @@ mod tests {
             upstream: "mock://secure".to_string(),
             mode: EnforcementMode::Block,
             enabled: true,
+            block_threshold: None,
         };
         let response = app_request(
             &app,
@@ -2325,6 +2770,7 @@ mod tests {
             reason: "botnet".to_string(),
             source: "unit".to_string(),
             ttl_seconds: 300,
+            prefix_len: None,
         };
         let response =
             app_request(&app, json_request(Method::POST, "/api/dnsbl", None, &dnsbl)).await;
@@ -2427,6 +2873,7 @@ mod tests {
             upstream: "mock://audit".to_string(),
             mode: EnforcementMode::Monitor,
             enabled: true,
+            block_threshold: None,
         };
 
         let unauthorized = app_request(
@@ -2728,6 +3175,7 @@ mod tests {
                         upstream: "mock://mock".to_string(),
                         mode: EnforcementMode::Monitor,
                         enabled: true,
+                        block_threshold: None,
                     },
                     RouteConfig {
                         id: "proxy".to_string(),
@@ -2735,6 +3183,7 @@ mod tests {
                         upstream: format!("http://{upstream_addr}"),
                         mode: EnforcementMode::Monitor,
                         enabled: true,
+                        block_threshold: None,
                     },
                     RouteConfig {
                         id: "down".to_string(),
@@ -2742,6 +3191,7 @@ mod tests {
                         upstream: format!("http://{unused_addr}"),
                         mode: EnforcementMode::Monitor,
                         enabled: true,
+                        block_threshold: None,
                     },
                     RouteConfig {
                         id: "truncated".to_string(),
@@ -2749,6 +3199,7 @@ mod tests {
                         upstream: format!("http://{raw_addr}"),
                         mode: EnforcementMode::Monitor,
                         enabled: true,
+                        block_threshold: None,
                     },
                 ],
                 threats: Vec::new(),
@@ -2816,6 +3267,7 @@ mod tests {
                 upstream: "mock://mock".to_string(),
                 mode: EnforcementMode::Monitor,
                 enabled: true,
+                block_threshold: None,
             },
             &Method::GET,
             "/mock",
@@ -2882,6 +3334,7 @@ mod tests {
                         upstream: "mock://api".to_string(),
                         mode: EnforcementMode::Block,
                         enabled: true,
+                        block_threshold: None,
                     },
                 );
             })
@@ -2941,6 +3394,7 @@ mod tests {
             reason: "scanner".to_string(),
             source: "unit".to_string(),
             ttl_seconds: 300,
+            prefix_len: None,
         }];
 
         upsert_dnsbl(
@@ -2951,6 +3405,7 @@ mod tests {
                 reason: "botnet".to_string(),
                 source: "feed".to_string(),
                 ttl_seconds: 600,
+                prefix_len: None,
             },
         );
 
@@ -3004,6 +3459,7 @@ mod tests {
                 upstream: "mock://api".to_string(),
                 mode: EnforcementMode::Monitor,
                 enabled: true,
+                block_threshold: None,
             }),
             Err("route id is required")
         );
@@ -3014,6 +3470,7 @@ mod tests {
                 upstream: "mock://api".to_string(),
                 mode: EnforcementMode::Monitor,
                 enabled: true,
+                block_threshold: None,
             }),
             Err("route path_prefix must start with /")
         );
@@ -3024,6 +3481,7 @@ mod tests {
                 upstream: "mock://api".to_string(),
                 mode: EnforcementMode::Monitor,
                 enabled: true,
+                block_threshold: None,
             }),
             Err("route path_prefix must not contain query or fragment characters")
         );
@@ -3034,6 +3492,7 @@ mod tests {
                 upstream: "mock://api".to_string(),
                 mode: EnforcementMode::Monitor,
                 enabled: true,
+                block_threshold: None,
             }),
             Err("route path_prefix must not contain query or fragment characters")
         );
@@ -3044,6 +3503,7 @@ mod tests {
                 upstream: " ".to_string(),
                 mode: EnforcementMode::Monitor,
                 enabled: true,
+                block_threshold: None,
             }),
             Err("route upstream is required")
         );
@@ -3094,6 +3554,7 @@ mod tests {
                 reason: " ".to_string(),
                 source: "unit".to_string(),
                 ttl_seconds: 300,
+                prefix_len: None,
             }),
             Err("DNSBL reason is required")
         );
@@ -3104,6 +3565,7 @@ mod tests {
                 reason: "scanner".to_string(),
                 source: " ".to_string(),
                 ttl_seconds: 300,
+                prefix_len: None,
             }),
             Err("DNSBL source is required")
         );
@@ -3114,6 +3576,7 @@ mod tests {
                 reason: "scanner".to_string(),
                 source: "unit".to_string(),
                 ttl_seconds: 0,
+                prefix_len: None,
             }),
             Err("DNSBL ttl_seconds must be greater than 0")
         );
@@ -3124,6 +3587,7 @@ mod tests {
                 reason: "scanner".to_string(),
                 source: "unit".to_string(),
                 ttl_seconds: 300,
+                prefix_len: None,
             }),
             Err("DNSBL response code must be in 127.0.0.0/8")
         );
@@ -3134,6 +3598,7 @@ mod tests {
                 reason: "scanner".to_string(),
                 source: "unit".to_string(),
                 ttl_seconds: 300,
+                prefix_len: None,
             }),
             Err("DNSBL response code must be an IPv4 loopback address")
         );
@@ -3144,6 +3609,7 @@ mod tests {
                 reason: "scanner".to_string(),
                 source: "unit".to_string(),
                 ttl_seconds: 300,
+                prefix_len: None,
             }),
             Err("DNSBL response code must be an IP address")
         );
@@ -3154,6 +3620,7 @@ mod tests {
                 upstream: "ftp://origin".to_string(),
                 mode: EnforcementMode::Monitor,
                 enabled: true,
+                block_threshold: None,
             }),
             Err("route upstream must start with mock://, http://, or https://")
         );
@@ -3175,6 +3642,7 @@ mod tests {
                 reason: "scanner".to_string(),
                 source: "unit".to_string(),
                 ttl_seconds: 300,
+                prefix_len: None,
             })
             .is_ok()
         );
@@ -3292,6 +3760,7 @@ mod tests {
                     reason: "scanner".to_string(),
                     source: "unit".to_string(),
                     ttl_seconds: 300,
+                    prefix_len: None,
                 }],
                 ..threat_feed_import()
             }),
@@ -3606,6 +4075,7 @@ mod tests {
                     upstream: "mock://mock".to_string(),
                     mode: EnforcementMode::Monitor,
                     enabled: true,
+                    block_threshold: None,
                 }],
                 threats: Vec::new(),
                 dnsbl: Vec::new(),
@@ -3637,6 +4107,7 @@ mod tests {
                     upstream: "mock://new".to_string(),
                     mode: EnforcementMode::Monitor,
                     enabled: true,
+                    block_threshold: None,
                 },
             ),
         )
@@ -3679,6 +4150,7 @@ mod tests {
                     reason: "scanner".to_string(),
                     source: "unit".to_string(),
                     ttl_seconds: 300,
+                    prefix_len: None,
                 },
             ),
         )
