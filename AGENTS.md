@@ -43,4 +43,3 @@ Cross-agent conventions for any agent (Claude, Codex, Cursor, opencode, …) wor
 - Org rule: substantive feature/process PRs should find the relevant academic papers and **commit their PDFs into the PR** (e.g. a `docs/papers/` or `references/` dir) with full citations, respecting copyright — attach the PDF only when redistribution is permissible; otherwise cite + link + summarize.
 - For this repo's domain, ground changes in the relevant literature — e.g. **load-balancing and anomaly-detection** research (WAF/IDS detection models, adaptive/DDoS-aware load balancing) for detection, routing, and rate-limiting work.
 <!-- END cwl-agent-guidance -->
-
